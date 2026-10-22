@@ -25,7 +25,8 @@ extern "C" {
 class test_uct_tcp_conn_timeout : public uct_test {
 public:
     test_uct_tcp_conn_timeout() :
-        m_tcp_iface(NULL), m_ent(NULL), m_err_count(0), m_err_status(UCS_OK)
+        m_tcp_iface(NULL), m_ent(NULL), m_err_count(0), m_err_status(UCS_OK),
+        m_err_cb_fd(-1)
     {
     }
 
@@ -46,7 +47,12 @@ public:
 protected:
     static const double CONN_TIMEOUT_SEC;
     static const double WAIT_TIMEOUT_SEC;
+    static const size_t CONN_ACK_PKT_PREREAD;
 
+    /* The error callback optionally writes raw bytes into a peer socket:
+     * this puts data on the wire from inside uct_worker_progress(), after
+     * the iface polled its event set and failed the EP, but before the
+     * one-shot callbacks of the worker progress queue run */
     static ucs_status_t err_handler(void *arg, uct_ep_h ep, ucs_status_t status)
     {
         test_uct_tcp_conn_timeout *self =
@@ -55,6 +61,13 @@ protected:
         self->m_err_count++;
         self->m_err_status = status;
         self->m_err_eps.push_back(ep);
+
+        if ((self->m_err_cb_fd != -1) && !self->m_err_cb_data.empty()) {
+            EXPECT_UCS_OK(ucs_socket_send(self->m_err_cb_fd,
+                                          &self->m_err_cb_data[0],
+                                          self->m_err_cb_data.size()));
+            self->m_err_cb_data.clear();
+        }
         return UCS_OK;
     }
 
@@ -115,6 +128,106 @@ protected:
 
         ucs_status_t status = ucs_socket_connect(fd, addr);
         EXPECT_TRUE((status == UCS_OK) || (status == UCS_INPROGRESS));
+        return fd;
+    }
+
+    /* Receive exactly @a length bytes from a raw socket, progressing the
+     * iface while waiting */
+    std::vector<uint8_t> raw_recv(int fd, size_t length)
+    {
+        ucs_time_t deadline = ucs_get_time() +
+                              ucs_time_from_sec(WAIT_TIMEOUT_SEC);
+        std::vector<uint8_t> data(length);
+        size_t offset = 0;
+        size_t chunk;
+        ucs_status_t status;
+
+        while ((offset < length) && (ucs_get_time() < deadline)) {
+            chunk  = length - offset;
+            status = ucs_socket_recv_nb(fd, &data[offset], 0, &chunk);
+            if (status == UCS_OK) {
+                offset += chunk;
+            } else if (status == UCS_ERR_NO_PROGRESS) {
+                progress();
+            } else {
+                ADD_FAILURE() << "recv failed: " << ucs_status_string(status);
+                break;
+            }
+        }
+        EXPECT_EQ(length, offset);
+        return data;
+    }
+
+    static void append(std::vector<uint8_t> &pkt, const void *data,
+                       size_t length)
+    {
+        pkt.insert(pkt.end(), (const uint8_t*)data,
+                   (const uint8_t*)data + length);
+    }
+
+    static void append_am_hdr(std::vector<uint8_t> &pkt, size_t length)
+    {
+        uct_tcp_am_hdr_t hdr;
+
+        hdr.am_id  = UCT_TCP_EP_CM_AM_ID;
+        hdr.length = length;
+        append(pkt, &hdr, sizeof(hdr));
+    }
+
+    /* CONN_REQ as sent by a connecting peer: magic + AM hdr + req + addr */
+    std::vector<uint8_t> conn_req_pkt(const struct sockaddr *peer_addr)
+    {
+        std::vector<uint8_t> pkt;
+        uct_tcp_cm_conn_req_pkt_t req;
+        uint64_t magic = UCT_TCP_MAGIC_NUMBER;
+
+        append(pkt, &magic, sizeof(magic));
+        append_am_hdr(pkt, sizeof(req) + m_tcp_iface->config.sockaddr_len);
+        req.event         = UCT_TCP_CM_CONN_REQ;
+        req.flags         = 0;
+        req.cm_id.conn_sn = 0;
+        append(pkt, &req, sizeof(req));
+        append(pkt, peer_addr, m_tcp_iface->config.sockaddr_len);
+        return pkt;
+    }
+
+    static std::vector<uint8_t> conn_ack_pkt()
+    {
+        std::vector<uint8_t> pkt;
+        uint32_t event = UCT_TCP_CM_CONN_ACK;
+
+        append_am_hdr(pkt, sizeof(event));
+        append(pkt, &event, sizeof(event));
+        return pkt;
+    }
+
+    /* Peer which connects to the iface and sends magic + CONN_REQ (claiming
+     * the address @a peer_addr) followed by the first CONN_ACK_PKT_PREREAD
+     * bytes of a CONN_ACK. The iface creates an internal RX-only EP which
+     * becomes CONNECTED, is kept on the connection matching context and
+     * holds the partial CONN_ACK in its RX buffer. Returns the peer socket,
+     * the remaining CONN_ACK bytes are returned in @a ack_rest */
+    int preread_peer(const struct sockaddr *peer_addr,
+                     std::vector<uint8_t> &ack_rest)
+    {
+        std::vector<uint8_t> ack = conn_ack_pkt();
+        std::vector<uint8_t> pkt = conn_req_pkt(peer_addr);
+
+        EXPECT_TRUE(CONN_ACK_PKT_PREREAD < sizeof(uct_tcp_am_hdr_t));
+
+        int fd = raw_connect(iface_addr());
+        while (!ucs_socket_is_connected(fd)) {
+            progress();
+        }
+
+        append(pkt, &ack[0], CONN_ACK_PKT_PREREAD);
+        ASSERT_UCS_OK(ucs_socket_send(fd, &pkt[0], pkt.size()));
+
+        /* the internal EP replies with CONN_ACK once it is CONNECTED */
+        std::vector<uint8_t> reply = raw_recv(fd, ack.size());
+        EXPECT_EQ(ack, reply);
+
+        ack_rest.assign(ack.begin() + CONN_ACK_PKT_PREREAD, ack.end());
         return fd;
     }
 
@@ -187,6 +300,14 @@ protected:
         }
     }
 
+    /* Busy-wait for @a sec seconds without progressing anything */
+    static void spin_for(double sec)
+    {
+        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(sec);
+        while (ucs_get_time() < deadline) {
+        }
+    }
+
     size_t ep_count()
     {
         size_t num = 0;
@@ -249,10 +370,13 @@ protected:
     ucs_status_t          m_err_status;
     std::vector<uct_ep_h> m_err_eps;
     std::vector<int>      m_raw_fds;
+    int                   m_err_cb_fd;
+    std::vector<uint8_t>  m_err_cb_data;
 };
 
-const double test_uct_tcp_conn_timeout::CONN_TIMEOUT_SEC = 0.2;
-const double test_uct_tcp_conn_timeout::WAIT_TIMEOUT_SEC = 10.0;
+const double test_uct_tcp_conn_timeout::CONN_TIMEOUT_SEC     = 0.2;
+const double test_uct_tcp_conn_timeout::WAIT_TIMEOUT_SEC     = 10.0;
+const size_t test_uct_tcp_conn_timeout::CONN_ACK_PKT_PREREAD = 2;
 
 #define UCT_TCP_CONN_TIMEOUT_CFG "TCP_CONN_TIMEOUT=200ms"
 
@@ -485,6 +609,58 @@ UCS_TEST_P(test_uct_tcp_conn_timeout, multiple_eps_stall,
         EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(eps[i]));
         uct_ep_destroy(eps[i]);
     }
+}
+
+/* The peer connected first and its CONN_REQ + partial CONN_ACK were read
+ * into an internal EP, so uct_ep_create() takes over the socket through
+ * uct_tcp_ep_replace_ep(), which schedules a one-shot RX progress for the
+ * pre-read data. The timeout expires before the one-shot runs: the sweep
+ * fails the EP (CLOSED, error callback) in the same uct_worker_progress()
+ * in which the one-shot runs, and the rest of the CONN_ACK is written by
+ * the error callback, i.e. after the event set was polled and before the
+ * one-shot runs. The failed EP must stay CLOSED and must not process the
+ * CONN_ACK (CLOSED->CONNECTED is illegal) */
+UCS_TEST_P(test_uct_tcp_conn_timeout, replace_ep_preread_then_timeout,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    struct sockaddr_storage peer_addr;
+    std::vector<uint8_t> ack_rest;
+    size_t fd_count;
+
+    raw_listener(&peer_addr);
+    int fd   = preread_peer((struct sockaddr*)&peer_addr, ack_rest);
+    fd_count = open_fd_count();
+
+    uct_ep_h ep = create_ep_to_port(port_of((struct sockaddr*)&peer_addr));
+    /* the internal EP was taken over: no new socket, WAITING_ACK right away */
+    ASSERT_EQ(UCT_TCP_EP_CONN_STATE_WAITING_ACK, conn_state(ep));
+    EXPECT_EQ(fd_count, open_fd_count());
+    EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+
+    m_err_cb_fd   = fd;
+    m_err_cb_data = ack_rest;
+
+    /* let the deadline expire without progressing, then a single progress:
+     * event set (nothing readable) -> timeout sweep -> error callback writes
+     * the rest of CONN_ACK -> one-shot RX progress of the pre-read data */
+    spin_for(2 * CONN_TIMEOUT_SEC);
+    progress();
+
+    ASSERT_EQ(1u, m_err_count);
+    EXPECT_TRUE(m_err_cb_data.empty());
+    EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(ep));
+    EXPECT_EQ(0u, m_tcp_iface->outstanding);
+
+    /* the peer got our CONN_REQ before the EP failed */
+    std::vector<uint8_t> req = raw_recv(fd, sizeof(uct_tcp_am_hdr_t) +
+                                            sizeof(uct_tcp_cm_conn_req_pkt_t) +
+                                            m_tcp_iface->config.sockaddr_len);
+    EXPECT_EQ(UCT_TCP_EP_CM_AM_ID, req[0]);
+    check_failed_ep(ep);
+
+    uct_ep_destroy(ep);
+    EXPECT_EQ(fd_count - 1, open_fd_count());
 }
 
 _UCT_INSTANTIATE_TEST_CASE(test_uct_tcp_conn_timeout, tcp)
