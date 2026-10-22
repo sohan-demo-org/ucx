@@ -31,7 +31,9 @@ of UCX, so a bug here shows up as a stall or a hang in model loading, not as a c
 Every connection in the TCP driver walks a small **state machine** —
 `CLOSED → CONNECTING → WAITING_ACK → CONNECTED` (or `RECV_MAGIC → ACCEPTING → CONNECTED` on the accepting
 side) — enforced in `src/uct/tcp/tcp_cm.c`, with a counter of "connections still in progress" that `flush()`
-waits on. Most of the subtle bugs in a transport library live in those transitions.
+waits on. Most of the subtle bugs in a transport library live in those transitions. A connection that
+does not reach `CONNECTED` within `UCX_TCP_CONN_TIMEOUT` (default `60s`, `inf` disables it) is failed
+instead of keeping `flush()` waiting forever.
 
 ---
 

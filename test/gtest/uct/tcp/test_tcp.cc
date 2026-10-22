@@ -231,9 +231,67 @@ private:
     }
 
 protected:
+    static ucs_status_t
+    conn_timeout_err_handler(void *arg, uct_ep_h ep, ucs_status_t status)
+    {
+        m_err_status = status;
+        ++m_err_count;
+        return UCS_OK;
+    }
+
+    void wait_handshake_timeout(uct_tcp_ep_conn_state_t state)
+    {
+        std::vector<int> fds;
+
+        setup_conns_to_entity(*m_ent, 1, fds);
+
+        if (state == UCT_TCP_EP_CONN_STATE_ACCEPTING) {
+            constexpr uint64_t magic_number = UCT_TCP_MAGIC_NUMBER;
+            std::vector<char> buf(sizeof(magic_number));
+
+            memcpy(&buf[0], &magic_number, sizeof(magic_number));
+            post_send(fds.front(), buf);
+        }
+
+        wait_for_cond([this, state]() { return get_ep_num(state) == 1; },
+                      [this]() { progress(); });
+        ASSERT_EQ(1, get_ep_num(state));
+        EXPECT_EQ(state == UCT_TCP_EP_CONN_STATE_ACCEPTING,
+                  m_tcp_iface->outstanding);
+
+        wait_for_cond([this]() {
+                          return ucs_list_is_empty(&m_tcp_iface->ep_list);
+                      },
+                      [this]() { progress(); });
+        EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->ep_list));
+        EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->handshake_ep_list));
+        EXPECT_EQ(0, m_tcp_iface->outstanding);
+
+        close(fds.front());
+    }
+
+    size_t get_ep_num(uct_tcp_ep_conn_state_t state)
+    {
+        size_t num = 0;
+        uct_tcp_ep_t *ep;
+
+        UCS_ASYNC_BLOCK(m_tcp_iface->super.worker->async);
+        ucs_list_for_each(ep, &m_tcp_iface->ep_list, list) {
+            num += (ep->conn_state == state);
+        }
+        UCS_ASYNC_UNBLOCK(m_tcp_iface->super.worker->async);
+
+        return num;
+    }
+
     uct_tcp_iface *m_tcp_iface;
     entity        *m_ent;
+    static ucs_status_t m_err_status;
+    static size_t       m_err_count;
 };
+
+ucs_status_t test_uct_tcp::m_err_status = UCS_OK;
+size_t test_uct_tcp::m_err_count        = 0;
 
 UCS_TEST_P(test_uct_tcp, listener_flood_connect_and_send_large) {
     const size_t max_conn =
@@ -310,5 +368,63 @@ UCS_TEST_P(test_uct_tcp, check_addr_len)
     EXPECT_EQ(sizeof(uct_tcp_ep_addr_t), iface_attr.ep_addr_len);
 }
 
+UCS_TEST_P(test_uct_tcp, conn_timeout_recv_magic_number, "TCP_CONN_TIMEOUT=200ms")
+{
+    wait_handshake_timeout(UCT_TCP_EP_CONN_STATE_RECV_MAGIC_NUMBER);
+}
+
+UCS_TEST_P(test_uct_tcp, conn_timeout_accepting, "TCP_CONN_TIMEOUT=200ms")
+{
+    wait_handshake_timeout(UCT_TCP_EP_CONN_STATE_ACCEPTING);
+}
+
+UCS_TEST_P(test_uct_tcp, conn_timeout_connect, "TCP_CONN_TIMEOUT=200ms")
+{
+    m_err_status = UCS_OK;
+    m_err_count  = 0;
+
+    /* The peer is never progressed, so it never replies to the connection
+     * request */
+    entity *sender = uct_test::create_entity(0, conn_timeout_err_handler);
+    m_entities.push_back(sender);
+
+    sender->connect_to_iface(0, *m_ent);
+
+    uct_tcp_iface_t *sender_iface = ucs_derived_of(sender->iface(),
+                                                   uct_tcp_iface_t);
+    uct_tcp_ep_t *ep              = ucs_derived_of(sender->ep(0),
+                                                   uct_tcp_ep_t);
+    EXPECT_TRUE((ep->conn_state == UCT_TCP_EP_CONN_STATE_CONNECTING) ||
+                (ep->conn_state == UCT_TCP_EP_CONN_STATE_WAITING_ACK));
+    EXPECT_EQ(1, sender_iface->outstanding);
+    EXPECT_EQ(UCS_INPROGRESS, uct_iface_flush(sender->iface(), 0, NULL));
+
+    {
+        scoped_log_handler slh(wrap_errors_logger);
+        wait_for_cond([]() { return m_err_count > 0; },
+                      [sender]() { sender->progress(); });
+    }
+
+    EXPECT_EQ(1, m_err_count);
+    EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT, m_err_status);
+    EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, ep->conn_state);
+    EXPECT_TRUE(ucs_list_is_empty(&sender_iface->handshake_ep_list));
+    EXPECT_EQ(0, sender_iface->outstanding);
+    EXPECT_UCS_OK(uct_iface_flush(sender->iface(), 0, NULL));
+}
+
+UCS_TEST_P(test_uct_tcp, conn_timeout_inf, "TCP_CONN_TIMEOUT=inf")
+{
+    std::vector<int> fds;
+
+    setup_conns_to_entity(*m_ent, 1, fds);
+    EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->handshake_ep_list));
+
+    /* Make sure that the EP is not failed */
+    wait_for_cond([]() { return false; }, [this]() { progress(); }, 0.5);
+    EXPECT_EQ(1, get_accepted_conn_num(*m_ent));
+
+    close(fds.front());
+}
 
 _UCT_INSTANTIATE_TEST_CASE(test_uct_tcp, tcp)

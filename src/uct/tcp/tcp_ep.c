@@ -239,6 +239,7 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_ep_t, uct_tcp_iface_t *iface, int fd,
     self->cm_id.conn_sn = UCT_TCP_CM_CONN_SN_MAX;
 
     ucs_list_head_init(&self->list);
+    ucs_list_head_init(&self->handshake_list);
     ucs_queue_head_init(&self->pending_q);
     ucs_queue_head_init(&self->put_comp_q);
 
@@ -1045,12 +1046,10 @@ void uct_tcp_ep_pending_queue_dispatch(uct_tcp_ep_t *ep)
     }
 }
 
-static void uct_tcp_ep_handle_disconnected(uct_tcp_ep_t *ep, ucs_status_t status)
+static void uct_tcp_ep_release_tx(uct_tcp_ep_t *ep, ucs_status_t status)
 {
     uct_tcp_iface_t *iface = ucs_derived_of(ep->super.super.iface,
                                             uct_tcp_iface_t);
-
-    ucs_debug("tcp_ep %p: remote disconnected", ep);
 
     if (ep->flags & UCT_TCP_EP_FLAG_CTX_TYPE_TX) {
         if (ep->flags & UCT_TCP_EP_FLAG_CTX_TYPE_RX) {
@@ -1069,8 +1068,43 @@ static void uct_tcp_ep_handle_disconnected(uct_tcp_ep_t *ep, ucs_status_t status
 
         uct_tcp_ep_tx_completed(ep, ep->tx.length - ep->tx.offset);
     }
+}
 
+static void uct_tcp_ep_handle_disconnected(uct_tcp_ep_t *ep, ucs_status_t status)
+{
+    ucs_debug("tcp_ep %p: remote disconnected", ep);
+    uct_tcp_ep_release_tx(ep, status);
     uct_tcp_ep_set_failed(ep, UCS_ERR_CONNECTION_RESET);
+}
+
+void uct_tcp_ep_handle_conn_timeout(uct_tcp_ep_t *ep)
+{
+    uct_tcp_iface_t *iface = ucs_derived_of(ep->super.super.iface,
+                                            uct_tcp_iface_t);
+    char str_local_addr[UCS_SOCKADDR_STRING_LEN];
+    char str_remote_addr[UCS_SOCKADDR_STRING_LEN];
+
+    if ((ep->conn_state == UCT_TCP_EP_CONN_STATE_ACCEPTING) ||
+        (ep->conn_state == UCT_TCP_EP_CONN_STATE_RECV_MAGIC_NUMBER)) {
+        /* ep::peer_addr may be not set yet */
+        ucs_diag("tcp_ep %p: connection handshake timed out in state %s "
+                 "after %.3f sec, fd %d", ep,
+                 uct_tcp_ep_cm_state[ep->conn_state].name,
+                 ucs_time_to_sec(iface->config.conn_timeout), ep->fd);
+    } else {
+        ucs_diag("tcp_ep %p: [%s]<->[%s]:%"PRIu64" connection handshake "
+                 "timed out in state %s after %.3f sec, fd %d", ep,
+                 ucs_sockaddr_str((const struct sockaddr*)&iface->config.ifaddr,
+                                  str_local_addr, UCS_SOCKADDR_STRING_LEN),
+                 ucs_sockaddr_str((const struct sockaddr*)&ep->peer_addr,
+                                  str_remote_addr, UCS_SOCKADDR_STRING_LEN),
+                 uct_tcp_ep_get_cm_id(ep),
+                 uct_tcp_ep_cm_state[ep->conn_state].name,
+                 ucs_time_to_sec(iface->config.conn_timeout), ep->fd);
+    }
+
+    uct_tcp_ep_release_tx(ep, UCS_ERR_ENDPOINT_TIMEOUT);
+    uct_tcp_ep_set_failed(ep, UCS_ERR_ENDPOINT_TIMEOUT);
 }
 
 static inline ucs_status_t uct_tcp_ep_handle_send_err(uct_tcp_ep_t *ep,

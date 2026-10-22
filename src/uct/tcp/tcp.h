@@ -349,6 +349,11 @@ struct uct_tcp_ep {
     ucs_queue_head_t              pending_q;    /* Pending operations */
     ucs_queue_head_t              put_comp_q;   /* Flush completions waiting for
                                                  * outstanding PUTs acknowledgment */
+    ucs_time_t                    handshake_start_time; /* Time when the EP
+                                                         * entered a handshake
+                                                         * state from CLOSED */
+    ucs_list_link_t               handshake_list; /* List element to insert into
+                                                   * TCP iface handshake EP list */
     union {
         ucs_list_link_t           list;         /* List element to insert into TCP EP list */
         ucs_conn_match_elem_t     elem;         /* Connection matching element, used by EPs
@@ -373,6 +378,9 @@ typedef struct uct_tcp_iface {
                                                       * EPs created with
                                                       * CONNECT_TO_EP method */
     ucs_list_link_t               ep_list;           /* List of endpoints */
+    ucs_list_link_t               handshake_ep_list; /* EPs in a handshake state,
+                                                      * ordered by the handshake
+                                                      * start time */
     char                          if_name[IFNAMSIZ]; /* Network interface name */
     ucs_sys_event_set_t           *event_set;        /* Event set identifier */
     ucs_mpool_t                   tx_mpool;          /* TX memory pool */
@@ -412,6 +420,9 @@ typedef struct uct_tcp_iface {
                                                       * before aborting the attempt to connect.
                                                       * It cannot exceed 255. */
         ucs_time_t                user_timeout;      /* TCP_USER_TIMEOUT */
+        ucs_time_t                conn_timeout;      /* Maximal time for an EP to
+                                                      * complete the connection
+                                                      * handshake */
         double                    max_bw;            /* Upper bound to TCP iface bandwidth */
         struct {
             ucs_time_t            idle;              /* The time the connection needs to remain
@@ -451,6 +462,7 @@ typedef struct uct_tcp_iface_config {
     uct_tcp_send_recv_buf_config_t sockopt;
     unsigned                       syn_cnt;
     ucs_time_t                     user_timeout;
+    ucs_time_t                     conn_timeout;
     uct_iface_mpool_config_t       tx_mpool;
     uct_iface_mpool_config_t       rx_mpool;
     ucs_range_spec_t               port_range;
@@ -580,6 +592,8 @@ void uct_tcp_ep_destroy(uct_ep_h tl_ep);
 
 void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep, ucs_status_t status);
 
+void uct_tcp_ep_handle_conn_timeout(uct_tcp_ep_t *ep);
+
 void uct_tcp_ep_replace_ep(uct_tcp_ep_t *to_ep, uct_tcp_ep_t *from_ep);
 
 int uct_tcp_ep_is_self(const uct_tcp_ep_t *ep);
@@ -659,6 +673,8 @@ ucs_status_t uct_tcp_cm_handle_incoming_conn(uct_tcp_iface_t *iface,
                                              int fd);
 
 ucs_status_t uct_tcp_cm_conn_start(uct_tcp_ep_t *ep);
+
+unsigned uct_tcp_cm_conn_timeout_progress(uct_tcp_iface_t *iface);
 
 int uct_tcp_keepalive_is_enabled(uct_tcp_iface_t *iface);
 

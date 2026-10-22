@@ -304,6 +304,18 @@ and their indexes.
 
 ---
 <br/>
+### TCP
+
+#### How to limit the time of TCP connection establishment?
+Set `UCX_TCP_CONN_TIMEOUT` (default: `60s`). A TCP endpoint which did not
+complete the connection handshake within this time, for example because the
+peer stopped responding during connection establishment, is failed with an
+endpoint timeout error instead of waiting indefinitely, so flush operations do
+not hang on it. The timer restarts on every connection retry. Setting
+`UCX_TCP_CONN_TIMEOUT=inf` disables the timeout.
+
+<br/>
+
 
 ## Working with GPU
 
