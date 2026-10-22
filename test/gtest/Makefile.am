@@ -143,6 +143,7 @@ gtest_SOURCES = \
 	uct/test_tag.cc \
 	uct/tcp/test_tcp.cc \
 	uct/tcp/test_tcp_conn_timeout.cc \
+	uct/tcp/test_tcp_explore_simult_connect_stale_fd.cc \
 	\
 	ucp/test_ucp_am.cc \
 	ucp/test_ucp_ep.cc \
