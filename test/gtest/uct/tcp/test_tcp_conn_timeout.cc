@@ -26,7 +26,7 @@ class test_uct_tcp_conn_timeout : public uct_test {
 public:
     test_uct_tcp_conn_timeout() :
         m_tcp_iface(NULL), m_ent(NULL), m_err_count(0), m_err_status(UCS_OK),
-        m_err_cb_fd(-1)
+        m_err_cb_fd(-1), m_err_cb_reconnect_port(0), m_err_cb_ep(NULL)
     {
     }
 
@@ -49,10 +49,13 @@ protected:
     static const double WAIT_TIMEOUT_SEC;
     static const size_t CONN_ACK_PKT_PREREAD;
 
-    /* The error callback optionally writes raw bytes into a peer socket:
-     * this puts data on the wire from inside uct_worker_progress(), after
-     * the iface polled its event set and failed the EP, but before the
-     * one-shot callbacks of the worker progress queue run */
+    /* The error callback optionally:
+     * - writes raw bytes into a peer socket: this puts data on the wire from
+     *   inside uct_worker_progress(), after the iface polled its event set
+     *   and failed the EP, but before the one-shot callbacks of the worker
+     *   progress queue run;
+     * - destroys the failed EP and reconnects to the same peer with a new
+     *   EP (once), as a user which handles the error by reconnecting does */
     static ucs_status_t err_handler(void *arg, uct_ep_h ep, ucs_status_t status)
     {
         test_uct_tcp_conn_timeout *self =
@@ -67,6 +70,13 @@ protected:
                                           &self->m_err_cb_data[0],
                                           self->m_err_cb_data.size()));
             self->m_err_cb_data.clear();
+        }
+
+        if (self->m_err_cb_reconnect_port != 0) {
+            uct_ep_destroy(ep);
+            self->m_err_cb_ep = self->create_ep_to_port(
+                    self->m_err_cb_reconnect_port);
+            self->m_err_cb_reconnect_port = 0;
         }
         return UCS_OK;
     }
@@ -466,6 +476,8 @@ protected:
     std::vector<int>      m_raw_fds;
     int                   m_err_cb_fd;
     std::vector<uint8_t>  m_err_cb_data;
+    uint16_t              m_err_cb_reconnect_port;
+    uct_ep_h              m_err_cb_ep;
 };
 
 const double test_uct_tcp_conn_timeout::CONN_TIMEOUT_SEC     = 0.2;
@@ -717,6 +729,54 @@ UCS_TEST_P(test_uct_tcp_conn_timeout, multiple_eps_stall,
         EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(eps[i]));
         uct_ep_destroy(eps[i]);
     }
+}
+
+/* The error callback destroys the timed out EP and reconnects to the same
+ * peer with a new EP, which is armed. The timeout sweep must not access the
+ * failed EP after uct_tcp_ep_set_failed() returned: its memory is freed
+ * (detected by ASAN / valgrind) and may already be reused by the new EP */
+UCS_TEST_P(test_uct_tcp_conn_timeout, err_cb_destroys_failed_ep,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    struct sockaddr_storage listen_addr;
+    size_t fd_count;
+
+    raw_listener(&listen_addr);
+    fd_count      = open_fd_count();
+    uint16_t port = port_of((struct sockaddr*)&listen_addr);
+    uct_ep_h ep   = create_ep_to_port(port);
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+
+    m_err_cb_reconnect_port = port;
+    wait_for_err(1);
+    ASSERT_EQ(1u, m_err_count);
+    EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT, m_err_status);
+    EXPECT_EQ(ep, m_err_eps[0]);
+    EXPECT_EQ(0, m_err_cb_reconnect_port);
+    ASSERT_TRUE(m_err_cb_ep != NULL);
+
+    /* only the new EP is establishing a connection now */
+    EXPECT_TRUE(tcp_ep(m_err_cb_ep)->flags &
+                UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+    EXPECT_EQ(1u, ucs_list_length(&m_tcp_iface->conn_timeout_list));
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+
+    /* the new EP times out as well and is reported once */
+    wait_for_err(2);
+    ASSERT_EQ(2u, m_err_count);
+    EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT, m_err_status);
+    EXPECT_EQ(m_err_cb_ep, m_err_eps[1]);
+    EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(m_err_cb_ep));
+    EXPECT_EQ(0u, tcp_ep(m_err_cb_ep)->events);
+    EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+    EXPECT_EQ(0u, m_tcp_iface->outstanding);
+    EXPECT_UCS_OK(uct_iface_flush(m_ent->iface(), 0, NULL));
+
+    progress_for(2 * CONN_TIMEOUT_SEC);
+    EXPECT_EQ(2u, m_err_count);
+
+    uct_ep_destroy(m_err_cb_ep);
+    EXPECT_EQ(fd_count, open_fd_count());
 }
 
 /* The peer connected first and its CONN_REQ + partial CONN_ACK were read
