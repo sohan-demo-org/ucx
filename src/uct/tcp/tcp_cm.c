@@ -50,7 +50,7 @@ unsigned uct_tcp_cm_conn_timeout_progress(uct_tcp_iface_t *iface)
     uct_tcp_ep_t *ep;
 
     /* Re-read the head on every iteration: failing an EP may invoke the user's
-     * error handler, which can destroy other EPs */
+     * error handler, which can destroy the failed EP and other EPs */
     while (!ucs_list_is_empty(&iface->conn_timeout_list)) {
         ep = ucs_list_head(&iface->conn_timeout_list, uct_tcp_ep_t,
                            conn_timeout_list);
@@ -67,9 +67,9 @@ unsigned uct_tcp_cm_conn_timeout_progress(uct_tcp_iface_t *iface)
 
         /* Removes the EP from the timeout list and either reports the error
          * to the user (TX / CONNECT_TO_EP EP) or schedules destroying the
-         * internal EP */
+         * internal EP. The EP must not be accessed afterwards: the user's
+         * error handler may have destroyed it */
         uct_tcp_ep_set_failed(ep, UCS_ERR_ENDPOINT_TIMEOUT);
-        ucs_assert(!(ep->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED));
         ++count;
     }
 
