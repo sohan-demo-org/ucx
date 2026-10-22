@@ -11,6 +11,31 @@
 
 # Unified Communication X
 
+## What is UCX, in plain English?
+
+**UCX moves data between two computers, or two programs, as fast as the hardware allows.**
+That is all it does — and it does it for high-performance computing and AI clusters, where
+GPU boxes constantly hand each other model weights, tensors and messages.
+
+Think of it as a phone system with three layers:
+
+| Layer | Directory | Phone analogy | What it really does |
+|---|---|---|---|
+| **UCP** — "the caller" | `src/ucp` | Decides *how* to reach you (landline, cell, intercom) and does the "hello, can you hear me?" handshake | Picks the best transport for each peer, runs the connection handshake ("wireup"), splits big messages |
+| **UCT** — "the lines" | `src/uct` | The physical wires | One driver per transport: TCP, shared memory, InfiniBand / RoCE (RDMA), CUDA, ROCm, … |
+| **UCS** — "the switchboard" | `src/ucs` | Plumbing nobody talks about | Timers, sockets, config knobs, logging, asserts |
+
+Why it matters: libraries such as NCCL-adjacent transfer layers (for example NVIDIA's NIXL) sit *on top*
+of UCX, so a bug here shows up as a stall or a hang in model loading, not as a crash in your own code.
+
+Every connection in the TCP driver walks a small **state machine** —
+`CLOSED → CONNECTING → WAITING_ACK → CONNECTED` (or `RECV_MAGIC → ACCEPTING → CONNECTED` on the accepting
+side) — enforced in `src/uct/tcp/tcp_cm.c`, with a counter of "connections still in progress" that `flush()`
+waits on. Most of the subtle bugs in a transport library live in those transitions.
+
+---
+
+
 Unified Communication X (UCX) is an
 [award winning](https://losalamosreporter.com/2019/11/07/nine-los-alamos-national-laboratory-projects-win-rd-100-awards),
 optimized production proven-communication framework for modern, high-bandwidth
