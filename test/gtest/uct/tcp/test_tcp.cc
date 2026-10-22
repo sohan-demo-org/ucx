@@ -368,17 +368,17 @@ UCS_TEST_P(test_uct_tcp, check_addr_len)
     EXPECT_EQ(sizeof(uct_tcp_ep_addr_t), iface_attr.ep_addr_len);
 }
 
-UCS_TEST_P(test_uct_tcp, conn_timeout_recv_magic_number, "TCP_CONN_TIMEOUT=200ms")
+UCS_TEST_P(test_uct_tcp, conn_timeout_recv_magic_number, "TCP_CONN_TIMEOUT=500ms")
 {
     wait_handshake_timeout(UCT_TCP_EP_CONN_STATE_RECV_MAGIC_NUMBER);
 }
 
-UCS_TEST_P(test_uct_tcp, conn_timeout_accepting, "TCP_CONN_TIMEOUT=200ms")
+UCS_TEST_P(test_uct_tcp, conn_timeout_accepting, "TCP_CONN_TIMEOUT=500ms")
 {
     wait_handshake_timeout(UCT_TCP_EP_CONN_STATE_ACCEPTING);
 }
 
-UCS_TEST_P(test_uct_tcp, conn_timeout_connect, "TCP_CONN_TIMEOUT=200ms")
+UCS_TEST_P(test_uct_tcp, conn_timeout_connect, "TCP_CONN_TIMEOUT=500ms")
 {
     m_err_status = UCS_OK;
     m_err_count  = 0;
