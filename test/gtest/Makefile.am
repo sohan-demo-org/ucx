@@ -142,6 +142,7 @@ gtest_SOURCES = \
 	uct/test_sockaddr.cc \
 	uct/test_tag.cc \
 	uct/tcp/test_tcp.cc \
+	uct/tcp/test_tcp_conn_timeout.cc \
 	\
 	ucp/test_ucp_am.cc \
 	ucp/test_ucp_ep.cc \

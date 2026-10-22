@@ -237,8 +237,10 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_ep_t, uct_tcp_iface_t *iface, int fd,
     self->flags         = 0;
     self->conn_state    = UCT_TCP_EP_CONN_STATE_CLOSED;
     self->cm_id.conn_sn = UCT_TCP_CM_CONN_SN_MAX;
+    self->conn_deadline = UCS_TIME_INFINITY;
 
     ucs_list_head_init(&self->list);
+    ucs_list_head_init(&self->conn_timeout_list);
     ucs_queue_head_init(&self->pending_q);
     ucs_queue_head_init(&self->put_comp_q);
 
@@ -496,6 +498,8 @@ void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep, ucs_status_t status)
         return;
     }
 
+    uct_tcp_cm_conn_timeout_disarm(ep);
+
     if (ep->flags & UCT_TCP_EP_FLAG_ON_MATCH_CTX) {
         uct_tcp_cm_remove_ep(iface, ep);
         uct_tcp_iface_add_ep(ep);
@@ -503,7 +507,27 @@ void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep, ucs_status_t status)
 
     uct_tcp_ep_mod_events(ep, 0, ep->events);
 
-    if (ep->flags & UCT_TCP_EP_FLAG_CTX_TYPE_TX) {
+    /* Data pre-read by an internal EP and taken over by
+     * uct_tcp_ep_replace_ep() is processed from a one-shot callback: remove
+     * it so that the failed EP doesn't handle e.g. CONN_ACK after it was
+     * moved to CLOSED and reported to the user */
+    ucs_callbackq_remove_oneshot(&iface->super.worker->super.progress_q, ep,
+                                 uct_tcp_ep_progress_rx_remove_filter, ep);
+
+    if (ep->flags & (UCT_TCP_EP_FLAG_CTX_TYPE_TX |
+                     UCT_TCP_EP_FLAG_ON_PTR_MAP)) {
+        /* The EP is exposed to the user: either it has TX capability or it
+         * is a CONNECT_TO_EP EP which is still waiting for CONN_REQ from a
+         * peer. Remove it from the EP PTR map so that a late CONN_REQ can't
+         * revive an EP which was already reported as failed, and account
+         * the failed accept attempt: an EP which is not on the EP PTR map
+         * anymore has done at least one connection attempt (see
+         * uct_tcp_ep_connect_to_ep_v2()) */
+        if (ep->flags & UCT_TCP_EP_FLAG_ON_PTR_MAP) {
+            ep->conn_retries++;
+            uct_tcp_ep_ptr_map_del(ep);
+        }
+
         ucs_debug("tcp_ep %p: calling error handler (flags: %x)", ep,
                   ep->flags);
         uct_tcp_cm_change_conn_state(ep, UCT_TCP_EP_CONN_STATE_CLOSED);
@@ -939,11 +963,13 @@ uct_tcp_ep_connect_to_ep_v2(uct_ep_h tl_ep,
     }
 
     if (uct_tcp_ep_ptr_map_get(iface, ep->cm_id.ptr_map_key) == NULL) {
-        /* If the EP doesn't exist anymore in the local EP PTR MAP, it means the
-         * EP was already connected to a peer's EP and removed from the EP PTR
-         * MAP as a part of CONN_REQ handling (only not connected yet EPs are
-         * contained in a PTR MAP) and then disconnected before a user called
-         * uct_ep_connect_to_ep() for the EP.
+        /* If the EP doesn't exist anymore in the local EP PTR MAP, it means
+         * either the EP was already connected to a peer's EP and removed from
+         * the EP PTR MAP as a part of CONN_REQ handling (only not connected
+         * yet EPs are contained in a PTR MAP) and then disconnected before a
+         * user called uct_ep_connect_to_ep() for the EP, or the EP was failed
+         * (e.g. the connection establishment timed out) while waiting for
+         * CONN_REQ from a peer.
          * So, just report to a caller that the connection was already reset */
         ucs_assert(uct_tcp_cm_ep_accept_conn(ep));
         ucs_assert(ep->conn_state == UCT_TCP_EP_CONN_STATE_CLOSED);

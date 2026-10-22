@@ -114,7 +114,10 @@ enum {
     /* EP is on EP PTR map. */
     UCT_TCP_EP_FLAG_ON_PTR_MAP         = UCS_BIT(9),
     /* EP has some operations done without flush */
-    UCT_TCP_EP_FLAG_NEED_FLUSH         = UCS_BIT(10)
+    UCT_TCP_EP_FLAG_NEED_FLUSH         = UCS_BIT(10),
+    /* EP is on the iface's connection timeout list, i.e. connection
+     * establishment is in progress and bounded by UCX_TCP_CONN_TIMEOUT */
+    UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED = UCS_BIT(11)
 };
 
 
@@ -343,6 +346,10 @@ struct uct_tcp_ep {
     int                           stale_fd;     /* Old file descriptor which should be
                                                  * closed as soon as the EP is connected
                                                  * using the new fd */
+    ucs_time_t                    conn_deadline; /* Time by which the connection
+                                                  * establishment must complete */
+    ucs_list_link_t               conn_timeout_list; /* Element of the iface's
+                                                      * connection timeout list */
     uct_tcp_ep_cm_id_t            cm_id;        /* EP connection manager ID */
     uct_tcp_ep_ctx_t              tx;           /* TX resources */
     uct_tcp_ep_ctx_t              rx;           /* RX resources */
@@ -373,6 +380,8 @@ typedef struct uct_tcp_iface {
                                                       * EPs created with
                                                       * CONNECT_TO_EP method */
     ucs_list_link_t               ep_list;           /* List of endpoints */
+    ucs_list_link_t               conn_timeout_list; /* EPs establishing a connection,
+                                                      * ordered by conn_deadline */
     char                          if_name[IFNAMSIZ]; /* Network interface name */
     ucs_sys_event_set_t           *event_set;        /* Event set identifier */
     ucs_mpool_t                   tx_mpool;          /* TX memory pool */
@@ -412,6 +421,7 @@ typedef struct uct_tcp_iface {
                                                       * before aborting the attempt to connect.
                                                       * It cannot exceed 255. */
         ucs_time_t                user_timeout;      /* TCP_USER_TIMEOUT */
+        ucs_time_t                conn_timeout;      /* Connection establishment timeout */
         double                    max_bw;            /* Upper bound to TCP iface bandwidth */
         struct {
             ucs_time_t            idle;              /* The time the connection needs to remain
@@ -451,6 +461,7 @@ typedef struct uct_tcp_iface_config {
     uct_tcp_send_recv_buf_config_t sockopt;
     unsigned                       syn_cnt;
     ucs_time_t                     user_timeout;
+    ucs_time_t                     conn_timeout;
     uct_iface_mpool_config_t       tx_mpool;
     uct_iface_mpool_config_t       rx_mpool;
     ucs_range_spec_t               port_range;
@@ -644,6 +655,10 @@ uct_tcp_cm_set_conn_state(uct_tcp_ep_t *ep,
 void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
                                   uct_tcp_ep_conn_state_t new_conn_state);
 
+void uct_tcp_cm_conn_timeout_disarm(uct_tcp_ep_t *ep);
+
+unsigned uct_tcp_cm_conn_timeout_progress(uct_tcp_iface_t *iface);
+
 void uct_tcp_cm_ep_set_conn_sn(uct_tcp_ep_t *ep);
 
 uct_tcp_ep_t *uct_tcp_cm_get_ep(uct_tcp_iface_t *iface,
@@ -667,6 +682,18 @@ static UCS_F_ALWAYS_INLINE int uct_tcp_ep_ctx_buf_empty(uct_tcp_ep_ctx_t *ctx)
     ucs_assert((ctx->length == 0) || (ctx->buf != NULL));
 
     return ctx->length == 0;
+}
+
+/**
+ * Connection establishment is in progress in these states: each of them holds
+ * one unit of iface->outstanding and is bounded by the connection timeout.
+ */
+static UCS_F_ALWAYS_INLINE int
+uct_tcp_ep_conn_in_progress(uct_tcp_ep_conn_state_t conn_state)
+{
+    return (conn_state == UCT_TCP_EP_CONN_STATE_CONNECTING) ||
+           (conn_state == UCT_TCP_EP_CONN_STATE_WAITING_ACK) ||
+           (conn_state == UCT_TCP_EP_CONN_STATE_ACCEPTING);
 }
 
 static inline void uct_tcp_iface_outstanding_inc(uct_tcp_iface_t *iface)
