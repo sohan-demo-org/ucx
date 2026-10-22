@@ -953,8 +953,11 @@ static UCS_CLASS_CLEANUP_FUNC(uct_tcp_iface_t)
     }
 
     uct_tcp_iface_ep_list_cleanup(self);
-    ucs_assert(ucs_list_is_empty(&self->conn_timeout_list));
+    /* EPs which are still establishing a connection are kept on the
+     * connection matching context and are destroyed (and disarmed) by its
+     * purge callback */
     ucs_conn_match_cleanup(&self->conn_match_ctx);
+    ucs_assert(ucs_list_is_empty(&self->conn_timeout_list));
     UCS_PTR_MAP_DESTROY(tcp_ep, &self->ep_ptr_map);
 
     ucs_mpool_cleanup(&self->rx_mpool, 1);
