@@ -80,6 +80,14 @@ static ucs_config_field_t uct_tcp_iface_config_table[] = {
 
   UCT_TCP_USER_TIMEOUT(ucs_offsetof(uct_tcp_iface_config_t, user_timeout)),
 
+  {"CONN_TIMEOUT", "inf",
+   "Maximum time for establishing a connection to a peer (non-blocking connect,\n"
+   "CONN_REQ/CONN_ACK exchange, waiting for CONN_REQ on an accepted socket).\n"
+   "An endpoint which is not connected within this time is reported as failed\n"
+   "with UCS_ERR_ENDPOINT_TIMEOUT. \"inf\" disables the timeout.",
+   ucs_offsetof(uct_tcp_iface_config_t, conn_timeout),
+   UCS_CONFIG_TYPE_TIME_UNITS},
+
   UCT_IFACE_MPOOL_CONFIG_FIELDS("TX_", -1, 8, 128m, 1.0, "send",
                                 ucs_offsetof(uct_tcp_iface_config_t, tx_mpool), ""),
 
@@ -460,6 +468,10 @@ unsigned uct_tcp_iface_progress(uct_iface_h tl_iface)
     } while ((max_events > 0) && (read_events == UCT_TCP_MAX_EVENTS) &&
              ((status == UCS_OK) || (status == UCS_INPROGRESS)));
 
+    if (ucs_unlikely(!ucs_list_is_empty(&iface->conn_timeout_list))) {
+        count += uct_tcp_cm_conn_timeout_progress(iface);
+    }
+
     return count;
 }
 
@@ -776,6 +788,7 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_iface_t, uct_md_h md, uct_worker_h worker,
     self->config.max_conn_retries  = config->max_conn_retries;
     self->config.syn_cnt           = config->syn_cnt;
     self->config.user_timeout      = config->user_timeout;
+    self->config.conn_timeout      = config->conn_timeout;
     self->sockopt.nodelay          = config->sockopt_nodelay;
     self->sockopt.sndbuf           = config->sockopt.sndbuf;
     self->sockopt.rcvbuf           = config->sockopt.rcvbuf;
@@ -853,6 +866,7 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     ucs_list_head_init(&self->ep_list);
+    ucs_list_head_init(&self->conn_timeout_list);
     ucs_conn_match_init(&self->conn_match_ctx, self->config.sockaddr_len,
                         UCT_TCP_CM_CONN_SN_MAX, &uct_tcp_cm_conn_match_ops);
     status = UCS_PTR_MAP_INIT(tcp_ep, &self->ep_ptr_map);
@@ -939,6 +953,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_tcp_iface_t)
     }
 
     uct_tcp_iface_ep_list_cleanup(self);
+    ucs_assert(ucs_list_is_empty(&self->conn_timeout_list));
     ucs_conn_match_cleanup(&self->conn_match_ctx);
     UCS_PTR_MAP_DESTROY(tcp_ep, &self->ep_ptr_map);
 

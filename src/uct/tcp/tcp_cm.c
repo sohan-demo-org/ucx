@@ -13,6 +13,69 @@
 #include <ucs/async/async.h>
 
 
+static void uct_tcp_cm_conn_timeout_arm(uct_tcp_ep_t *ep)
+{
+    uct_tcp_iface_t *iface = ucs_derived_of(ep->super.super.iface,
+                                            uct_tcp_iface_t);
+
+    if (iface->config.conn_timeout == UCS_TIME_INFINITY) {
+        return;
+    }
+
+    ucs_assert(!(ep->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED));
+    ucs_assert(!(ep->flags & UCT_TCP_EP_FLAG_FAILED));
+
+    /* All EPs use the same timeout, so appending to the tail keeps the list
+     * ordered by deadline */
+    ep->conn_deadline = ucs_get_time() + iface->config.conn_timeout;
+    ep->flags        |= UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED;
+    ucs_list_add_tail(&iface->conn_timeout_list, &ep->conn_timeout_list);
+}
+
+void uct_tcp_cm_conn_timeout_disarm(uct_tcp_ep_t *ep)
+{
+    if (!(ep->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED)) {
+        return;
+    }
+
+    ucs_list_del(&ep->conn_timeout_list);
+    ep->flags        &= ~UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED;
+    ep->conn_deadline = UCS_TIME_INFINITY;
+}
+
+unsigned uct_tcp_cm_conn_timeout_progress(uct_tcp_iface_t *iface)
+{
+    ucs_time_t now = ucs_get_time();
+    unsigned count = 0;
+    uct_tcp_ep_t *ep;
+
+    /* Re-read the head on every iteration: failing an EP may invoke the user's
+     * error handler, which can destroy other EPs */
+    while (!ucs_list_is_empty(&iface->conn_timeout_list)) {
+        ep = ucs_list_head(&iface->conn_timeout_list, uct_tcp_ep_t,
+                           conn_timeout_list);
+        if (now < ep->conn_deadline) {
+            break;
+        }
+
+        ucs_assert(ep->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+        ucs_assert(uct_tcp_ep_conn_in_progress(ep->conn_state));
+        ucs_diag("tcp_ep %p: connection establishment timed out after %.2f "
+                 "sec in state %s", ep,
+                 ucs_time_to_sec(iface->config.conn_timeout),
+                 uct_tcp_ep_cm_state[ep->conn_state].name);
+
+        /* Removes the EP from the timeout list and either reports the error
+         * to the user (TX / CONNECT_TO_EP EP) or schedules destroying the
+         * internal EP */
+        uct_tcp_ep_set_failed(ep, UCS_ERR_ENDPOINT_TIMEOUT);
+        ucs_assert(!(ep->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED));
+        ++count;
+    }
+
+    return count;
+}
+
 void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
                                   uct_tcp_ep_conn_state_t new_conn_state)
 {
@@ -64,9 +127,7 @@ void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
             return;
         }
 
-        if ((old_conn_state == UCT_TCP_EP_CONN_STATE_ACCEPTING) ||
-            (old_conn_state == UCT_TCP_EP_CONN_STATE_CONNECTING) ||
-            (old_conn_state == UCT_TCP_EP_CONN_STATE_WAITING_ACK)) {
+        if (uct_tcp_ep_conn_in_progress(old_conn_state)) {
             uct_tcp_iface_outstanding_dec(iface);
         }
 
@@ -90,6 +151,16 @@ void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
          * has already been logged, print w/o peer's address */
         full_log = 0;
         break;
+    }
+
+    /* The connection timeout is armed for exactly the states which hold a
+     * unit of iface->outstanding for connection establishment */
+    if (uct_tcp_ep_conn_in_progress(new_conn_state)) {
+        if (!uct_tcp_ep_conn_in_progress(old_conn_state)) {
+            uct_tcp_cm_conn_timeout_arm(ep);
+        }
+    } else {
+        uct_tcp_cm_conn_timeout_disarm(ep);
     }
 
     if (full_log) {

@@ -237,8 +237,10 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_ep_t, uct_tcp_iface_t *iface, int fd,
     self->flags         = 0;
     self->conn_state    = UCT_TCP_EP_CONN_STATE_CLOSED;
     self->cm_id.conn_sn = UCT_TCP_CM_CONN_SN_MAX;
+    self->conn_deadline = UCS_TIME_INFINITY;
 
     ucs_list_head_init(&self->list);
+    ucs_list_head_init(&self->conn_timeout_list);
     ucs_queue_head_init(&self->pending_q);
     ucs_queue_head_init(&self->put_comp_q);
 
@@ -496,6 +498,8 @@ void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep, ucs_status_t status)
         return;
     }
 
+    uct_tcp_cm_conn_timeout_disarm(ep);
+
     if (ep->flags & UCT_TCP_EP_FLAG_ON_MATCH_CTX) {
         uct_tcp_cm_remove_ep(iface, ep);
         uct_tcp_iface_add_ep(ep);
@@ -503,7 +507,16 @@ void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep, ucs_status_t status)
 
     uct_tcp_ep_mod_events(ep, 0, ep->events);
 
-    if (ep->flags & UCT_TCP_EP_FLAG_CTX_TYPE_TX) {
+    if (ep->flags & (UCT_TCP_EP_FLAG_CTX_TYPE_TX |
+                     UCT_TCP_EP_FLAG_ON_PTR_MAP)) {
+        /* The EP is exposed to the user: either it has TX capability or it
+         * is a CONNECT_TO_EP EP which is still waiting for CONN_REQ from a
+         * peer. Remove it from the EP PTR map so that a late CONN_REQ can't
+         * revive an EP which was already reported as failed. */
+        if (ep->flags & UCT_TCP_EP_FLAG_ON_PTR_MAP) {
+            uct_tcp_ep_ptr_map_del(ep);
+        }
+
         ucs_debug("tcp_ep %p: calling error handler (flags: %x)", ep,
                   ep->flags);
         uct_tcp_cm_change_conn_state(ep, UCT_TCP_EP_CONN_STATE_CLOSED);

@@ -1,0 +1,490 @@
+/**
+ * Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2025. ALL RIGHTS RESERVED.
+ * See file LICENSE for terms.
+ */
+
+#include <common/test.h>
+#include <uct/uct_test.h>
+
+extern "C" {
+#include <uct/api/uct.h>
+#include <uct/tcp/tcp.h>
+#include <ucs/sys/sock.h>
+}
+
+#include <dirent.h>
+
+
+/**
+ * Tests for UCX_TCP_CONN_TIMEOUT: an EP which is stuck in a connection
+ * establishment state (CONNECTING / WAITING_ACK / ACCEPTING) must be failed
+ * with UCS_ERR_ENDPOINT_TIMEOUT. The peers in these tests are raw sockets
+ * which deliberately never complete the UCT TCP handshake, so the tests do
+ * not depend on timing of a real peer.
+ */
+class test_uct_tcp_conn_timeout : public uct_test {
+public:
+    test_uct_tcp_conn_timeout() :
+        m_tcp_iface(NULL), m_ent(NULL), m_err_count(0), m_err_status(UCS_OK)
+    {
+    }
+
+    void init()
+    {
+        uct_test::init();
+        m_ent = uct_test::create_entity(0, err_handler);
+        m_entities.push_back(m_ent);
+        m_tcp_iface = ucs_derived_of(m_ent->iface(), uct_tcp_iface_t);
+    }
+
+    void cleanup()
+    {
+        close_fds(m_raw_fds);
+        uct_test::cleanup();
+    }
+
+protected:
+    static const double CONN_TIMEOUT_SEC;
+    static const double WAIT_TIMEOUT_SEC;
+
+    static ucs_status_t err_handler(void *arg, uct_ep_h ep, ucs_status_t status)
+    {
+        test_uct_tcp_conn_timeout *self =
+                reinterpret_cast<test_uct_tcp_conn_timeout*>(arg);
+
+        self->m_err_count++;
+        self->m_err_status = status;
+        self->m_err_eps.push_back(ep);
+        return UCS_OK;
+    }
+
+    static void close_fds(std::vector<int> &fds)
+    {
+        for (size_t i = 0; i < fds.size(); ++i) {
+            close(fds[i]);
+        }
+        fds.clear();
+    }
+
+    static size_t open_fd_count()
+    {
+        DIR *dir = opendir("/proc/self/fd");
+        size_t count = 0;
+
+        EXPECT_TRUE(dir != NULL);
+        while (readdir(dir) != NULL) {
+            ++count;
+        }
+        closedir(dir);
+        return count - 1; /* the directory stream itself */
+    }
+
+    const struct sockaddr *iface_addr() const
+    {
+        return (const struct sockaddr*)&m_tcp_iface->config.ifaddr;
+    }
+
+    /* Listening socket on the iface IP address which never accepts the
+     * connection and never speaks the UCT TCP protocol */
+    int raw_listener(struct sockaddr_storage *addr, int backlog = 16)
+    {
+        socklen_t addr_len;
+        size_t addr_size;
+        int fd;
+
+        memcpy(addr, iface_addr(), sizeof(*addr));
+        ASSERT_UCS_OK(ucs_sockaddr_set_port((struct sockaddr*)addr, 0));
+        ASSERT_UCS_OK(ucs_sockaddr_sizeof((struct sockaddr*)addr, &addr_size));
+        ASSERT_UCS_OK(ucs_socket_create(addr->ss_family, SOCK_STREAM, 0, &fd));
+        m_raw_fds.push_back(fd);
+
+        EXPECT_EQ(0, bind(fd, (struct sockaddr*)addr, addr_size));
+        EXPECT_EQ(0, listen(fd, backlog));
+        ASSERT_UCS_OK(ucs_socket_getname(fd, addr, &addr_len));
+        return fd;
+    }
+
+    /* Non-blocking raw socket connected (or connecting) to @a addr */
+    int raw_connect(const struct sockaddr *addr)
+    {
+        int fd;
+
+        ASSERT_UCS_OK(ucs_socket_create(addr->sa_family, SOCK_STREAM, 0, &fd));
+        m_raw_fds.push_back(fd);
+        ASSERT_UCS_OK(ucs_sys_fcntl_modfl(fd, O_NONBLOCK, 0));
+
+        ucs_status_t status = ucs_socket_connect(fd, addr);
+        EXPECT_TRUE((status == UCS_OK) || (status == UCS_INPROGRESS));
+        return fd;
+    }
+
+    uint16_t port_of(const struct sockaddr *addr)
+    {
+        uint16_t port = 0;
+        EXPECT_UCS_OK(ucs_sockaddr_get_port(addr, &port));
+        return port;
+    }
+
+    void fill_ep_params(uct_ep_params_t &params, uct_tcp_device_addr_t *dev_addr,
+                        uct_tcp_iface_addr_t *iface_addr, uint16_t port)
+    {
+        ASSERT_UCS_OK(uct_iface_get_device_address(m_ent->iface(),
+                                                   (uct_device_addr_t*)dev_addr));
+        iface_addr->port = htons(port);
+
+        params.field_mask = UCT_EP_PARAM_FIELD_IFACE |
+                            UCT_EP_PARAM_FIELD_DEV_ADDR |
+                            UCT_EP_PARAM_FIELD_IFACE_ADDR;
+        params.iface      = m_ent->iface();
+        params.dev_addr   = (uct_device_addr_t*)dev_addr;
+        params.iface_addr = (uct_iface_addr_t*)iface_addr;
+    }
+
+    /* CONNECT_TO_IFACE EP to a peer listening on @a port on the iface IP */
+    uct_ep_h create_ep_to_port(uint16_t port)
+    {
+        std::vector<uint8_t> dev_addr(m_ent->iface_attr().device_addr_len);
+        uct_tcp_iface_addr_t iface_addr;
+        uct_ep_params_t params;
+        uct_ep_h ep;
+
+        fill_ep_params(params, (uct_tcp_device_addr_t*)&dev_addr[0],
+                       &iface_addr, port);
+        ASSERT_UCS_OK(uct_ep_create(&params, &ep));
+        return ep;
+    }
+
+    static uct_tcp_ep_t *tcp_ep(uct_ep_h ep)
+    {
+        return ucs_derived_of(ep, uct_tcp_ep_t);
+    }
+
+    static uct_tcp_ep_conn_state_t conn_state(uct_ep_h ep)
+    {
+        return (uct_tcp_ep_conn_state_t)tcp_ep(ep)->conn_state;
+    }
+
+    bool err_reported(unsigned count)
+    {
+        return m_err_count >= count;
+    }
+
+    void wait_for_err(unsigned count = 1)
+    {
+        ucs_time_t deadline = ucs_get_time() +
+                              ucs_time_from_sec(WAIT_TIMEOUT_SEC);
+        while (!err_reported(count) && (ucs_get_time() < deadline)) {
+            progress();
+        }
+    }
+
+    /* Progress for @a sec seconds, wall clock */
+    void progress_for(double sec)
+    {
+        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(sec);
+        while (ucs_get_time() < deadline) {
+            progress();
+        }
+    }
+
+    size_t ep_count()
+    {
+        size_t num = 0;
+        uct_tcp_ep_t *ep;
+
+        UCS_ASYNC_BLOCK(m_tcp_iface->super.worker->async);
+        ucs_list_for_each(ep, &m_tcp_iface->ep_list, list) {
+            ++num;
+        }
+        UCS_ASYNC_UNBLOCK(m_tcp_iface->super.worker->async);
+        return num;
+    }
+
+    size_t ep_count_in_state(uct_tcp_ep_conn_state_t state)
+    {
+        size_t num = 0;
+        uct_tcp_ep_t *ep;
+
+        UCS_ASYNC_BLOCK(m_tcp_iface->super.worker->async);
+        ucs_list_for_each(ep, &m_tcp_iface->ep_list, list) {
+            num += (ep->conn_state == state);
+        }
+        UCS_ASYNC_UNBLOCK(m_tcp_iface->super.worker->async);
+        return num;
+    }
+
+    void wait_for_ep_count(size_t count)
+    {
+        ucs_time_t deadline = ucs_get_time() +
+                              ucs_time_from_sec(WAIT_TIMEOUT_SEC);
+        while ((ep_count() != count) && (ucs_get_time() < deadline)) {
+            progress();
+        }
+    }
+
+    /* Checks the invariants which must hold once the EP has been failed:
+     * error callback fired exactly once, the EP is CLOSED, it is no longer
+     * tracked by the timeout machinery, outstanding dropped to zero so the
+     * iface can be flushed, and extra progress doesn't fire the callback
+     * again */
+    void check_failed_ep(uct_ep_h ep)
+    {
+        ASSERT_EQ(1u, m_err_count);
+        EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT, m_err_status);
+        EXPECT_EQ(ep, m_err_eps[0]);
+        EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(ep));
+        EXPECT_EQ(0u, tcp_ep(ep)->events);
+        EXPECT_FALSE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+        EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+        EXPECT_EQ(0u, m_tcp_iface->outstanding);
+        EXPECT_UCS_OK(uct_iface_flush(m_ent->iface(), 0, NULL));
+
+        progress_for(2 * CONN_TIMEOUT_SEC);
+        EXPECT_EQ(1u, m_err_count);
+    }
+
+    uct_tcp_iface_t       *m_tcp_iface;
+    entity                *m_ent;
+    unsigned              m_err_count;
+    ucs_status_t          m_err_status;
+    std::vector<uct_ep_h> m_err_eps;
+    std::vector<int>      m_raw_fds;
+};
+
+const double test_uct_tcp_conn_timeout::CONN_TIMEOUT_SEC = 0.2;
+const double test_uct_tcp_conn_timeout::WAIT_TIMEOUT_SEC = 10.0;
+
+#define UCT_TCP_CONN_TIMEOUT_CFG "TCP_CONN_TIMEOUT=200ms"
+
+
+/* Default: no timeout, an EP stuck in WAITING_ACK stays there and keeps the
+ * iface outstanding (previous behaviour) */
+UCS_TEST_P(test_uct_tcp_conn_timeout, default_is_inf)
+{
+    struct sockaddr_storage listen_addr;
+    size_t fd_count;
+
+    EXPECT_EQ(UCS_TIME_INFINITY, m_tcp_iface->config.conn_timeout);
+
+    raw_listener(&listen_addr);
+    fd_count    = open_fd_count();
+    uct_ep_h ep = create_ep_to_port(port_of((struct sockaddr*)&listen_addr));
+
+    progress_for(5 * CONN_TIMEOUT_SEC);
+
+    EXPECT_EQ(0u, m_err_count);
+    EXPECT_EQ(UCT_TCP_EP_CONN_STATE_WAITING_ACK, conn_state(ep));
+    EXPECT_FALSE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+    EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+    EXPECT_EQ(UCS_INPROGRESS, uct_iface_flush(m_ent->iface(), 0, NULL));
+
+    uct_ep_destroy(ep);
+    EXPECT_EQ(0u, m_tcp_iface->outstanding);
+    EXPECT_UCS_OK(uct_iface_flush(m_ent->iface(), 0, NULL));
+    EXPECT_EQ(fd_count, open_fd_count());
+}
+
+/* Peer accepts the TCP connection (kernel completes the 3-way handshake) but
+ * never replies to CONN_REQ: EP is stuck in WAITING_ACK */
+UCS_TEST_P(test_uct_tcp_conn_timeout, waiting_ack_stall,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    struct sockaddr_storage listen_addr;
+    size_t fd_count;
+
+    EXPECT_EQ(ucs_time_from_sec(CONN_TIMEOUT_SEC),
+              m_tcp_iface->config.conn_timeout);
+
+    raw_listener(&listen_addr);
+    fd_count    = open_fd_count();
+    uct_ep_h ep = create_ep_to_port(port_of((struct sockaddr*)&listen_addr));
+
+    EXPECT_TRUE((conn_state(ep) == UCT_TCP_EP_CONN_STATE_CONNECTING) ||
+                (conn_state(ep) == UCT_TCP_EP_CONN_STATE_WAITING_ACK));
+    EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+    EXPECT_EQ(UCS_INPROGRESS, uct_iface_flush(m_ent->iface(), 0, NULL));
+
+    wait_for_err();
+    check_failed_ep(ep);
+
+    uct_ep_destroy(ep);
+    EXPECT_EQ(fd_count, open_fd_count());
+}
+
+/* Non-blocking connect() which never completes: the listener's accept queue
+ * is full so SYNs are dropped and the EP is stuck in CONNECTING */
+UCS_TEST_P(test_uct_tcp_conn_timeout, connecting_stall,
+           UCT_TCP_CONN_TIMEOUT_CFG, "TCP_CONN_NB=y")
+{
+    struct sockaddr_storage listen_addr;
+    size_t fd_count;
+
+    raw_listener(&listen_addr, 0);
+    /* Linux accepts backlog + 1 connections, over-fill the queue */
+    for (int i = 0; i < 4; ++i) {
+        raw_connect((struct sockaddr*)&listen_addr);
+    }
+    fd_count    = open_fd_count();
+    uct_ep_h ep = create_ep_to_port(port_of((struct sockaddr*)&listen_addr));
+
+    if (conn_state(ep) != UCT_TCP_EP_CONN_STATE_CONNECTING) {
+        uct_ep_destroy(ep);
+        UCS_TEST_SKIP_R("connect() completed, accept queue not full");
+    }
+
+    EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+
+    wait_for_err();
+    EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(ep));
+    check_failed_ep(ep);
+
+    uct_ep_destroy(ep);
+    EXPECT_EQ(fd_count, open_fd_count());
+}
+
+/* Peer connects to the iface and sends the magic number but never sends
+ * CONN_REQ: the internal RX EP created by the listener is stuck in ACCEPTING.
+ * There is no user EP, so no error callback; the EP has to be destroyed and
+ * the peer's socket closed */
+UCS_TEST_P(test_uct_tcp_conn_timeout, accepting_stall,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    uint64_t magic = UCT_TCP_MAGIC_NUMBER;
+    size_t fd_count;
+    uint8_t byte;
+    size_t len;
+    ucs_status_t status;
+
+    fd_count = open_fd_count();
+    int fd   = raw_connect(iface_addr());
+
+    /* wait for the connection to be established and send only the magic */
+    while (!ucs_socket_is_connected(fd)) {
+        progress();
+    }
+    ASSERT_UCS_OK(ucs_socket_send(fd, &magic, sizeof(magic)));
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(WAIT_TIMEOUT_SEC);
+    while ((ep_count_in_state(UCT_TCP_EP_CONN_STATE_ACCEPTING) == 0) &&
+           (ucs_get_time() < deadline)) {
+        progress();
+    }
+    ASSERT_EQ(1u, ep_count_in_state(UCT_TCP_EP_CONN_STATE_ACCEPTING));
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+    EXPECT_FALSE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+    EXPECT_EQ(UCS_INPROGRESS, uct_iface_flush(m_ent->iface(), 0, NULL));
+
+    wait_for_ep_count(0);
+    EXPECT_EQ(0u, ep_count());
+    EXPECT_EQ(0u, m_err_count);
+    EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+    EXPECT_EQ(0u, m_tcp_iface->outstanding);
+    EXPECT_UCS_OK(uct_iface_flush(m_ent->iface(), 0, NULL));
+
+    /* the accepted socket must have been closed by the iface */
+    deadline = ucs_get_time() + ucs_time_from_sec(WAIT_TIMEOUT_SEC);
+    do {
+        scoped_log_handler slh(wrap_errors_logger);
+        len    = sizeof(byte);
+        status = ucs_socket_recv_nb(fd, &byte, 0, &len);
+    } while ((status == UCS_ERR_NO_PROGRESS) && (ucs_get_time() < deadline));
+    EXPECT_NE(UCS_OK, status);
+    EXPECT_NE(UCS_ERR_NO_PROGRESS, status);
+
+    close_fds(m_raw_fds);
+    EXPECT_EQ(fd_count, open_fd_count());
+}
+
+/* CONNECT_TO_EP: the local side is the one which has to accept (its address
+ * is greater than the peer's), the peer never sends CONN_REQ: the user EP is
+ * stuck in ACCEPTING and must be reported to the user */
+UCS_TEST_P(test_uct_tcp_conn_timeout, connect_to_ep_accepting_stall,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    std::vector<uint8_t> dev_addr(m_ent->iface_attr().device_addr_len);
+    std::vector<uint8_t> ep_addr(m_ent->iface_attr().ep_addr_len);
+    uct_tcp_ep_addr_t *remote_addr = (uct_tcp_ep_addr_t*)&ep_addr[0];
+    uct_ep_connect_to_ep_params_t conn_params = {0};
+    struct sockaddr_storage listen_addr;
+    uct_ep_params_t params;
+    size_t fd_count;
+    uct_ep_h ep;
+    int cmp;
+    ucs_status_t status;
+
+    /* find a peer port which makes the local side the accepting one */
+    for (int i = 0; i < 64; ++i) {
+        raw_listener(&listen_addr);
+        cmp = ucs_sockaddr_cmp((struct sockaddr*)&listen_addr, iface_addr(),
+                               &status);
+        ASSERT_UCS_OK(status);
+        if (cmp < 0) {
+            break;
+        }
+    }
+    if (cmp >= 0) {
+        UCS_TEST_SKIP_R("could not get a peer port lower than the iface port");
+    }
+
+    fd_count          = open_fd_count();
+    params.field_mask = UCT_EP_PARAM_FIELD_IFACE;
+    params.iface      = m_ent->iface();
+    ASSERT_UCS_OK(uct_ep_create(&params, &ep));
+    ASSERT_UCS_OK(uct_ep_get_address(ep, (uct_ep_addr_t*)&ep_addr[0]));
+    ASSERT_UCS_OK(uct_iface_get_device_address(m_ent->iface(),
+                                               (uct_device_addr_t*)&dev_addr[0]));
+    remote_addr->iface_addr.port =
+            htons(port_of((struct sockaddr*)&listen_addr));
+    remote_addr->ptr_map_key     = 0x1234;
+
+    ASSERT_UCS_OK(uct_ep_connect_to_ep_v2(ep, (uct_device_addr_t*)&dev_addr[0],
+                                          (uct_ep_addr_t*)&ep_addr[0],
+                                          &conn_params));
+    ASSERT_EQ(UCT_TCP_EP_CONN_STATE_ACCEPTING, conn_state(ep));
+    EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+    EXPECT_EQ(1u, m_tcp_iface->outstanding);
+
+    wait_for_err();
+    check_failed_ep(ep);
+
+    uct_ep_destroy(ep);
+    EXPECT_EQ(fd_count, open_fd_count());
+}
+
+/* Several EPs stalled at the same time: each is reported exactly once */
+UCS_TEST_P(test_uct_tcp_conn_timeout, multiple_eps_stall,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    const unsigned num_eps = 8;
+    struct sockaddr_storage listen_addr;
+    std::vector<uct_ep_h> eps;
+
+    raw_listener(&listen_addr);
+    for (unsigned i = 0; i < num_eps; ++i) {
+        eps.push_back(create_ep_to_port(port_of((struct sockaddr*)&listen_addr)));
+    }
+    EXPECT_EQ((size_t)num_eps, m_tcp_iface->outstanding);
+
+    wait_for_err(num_eps);
+    ASSERT_EQ(num_eps, m_err_count);
+    EXPECT_EQ(0u, m_tcp_iface->outstanding);
+    EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+    EXPECT_UCS_OK(uct_iface_flush(m_ent->iface(), 0, NULL));
+
+    std::sort(m_err_eps.begin(), m_err_eps.end());
+    EXPECT_TRUE(std::unique(m_err_eps.begin(), m_err_eps.end()) ==
+                m_err_eps.end());
+
+    progress_for(2 * CONN_TIMEOUT_SEC);
+    EXPECT_EQ(num_eps, m_err_count);
+
+    for (unsigned i = 0; i < num_eps; ++i) {
+        EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(eps[i]));
+        uct_ep_destroy(eps[i]);
+    }
+}
+
+_UCT_INSTANTIATE_TEST_CASE(test_uct_tcp_conn_timeout, tcp)
