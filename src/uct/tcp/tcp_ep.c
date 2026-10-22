@@ -507,6 +507,13 @@ void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep, ucs_status_t status)
 
     uct_tcp_ep_mod_events(ep, 0, ep->events);
 
+    /* Data pre-read by an internal EP and taken over by
+     * uct_tcp_ep_replace_ep() is processed from a one-shot callback: remove
+     * it so that the failed EP doesn't handle e.g. CONN_ACK after it was
+     * moved to CLOSED and reported to the user */
+    ucs_callbackq_remove_oneshot(&iface->super.worker->super.progress_q, ep,
+                                 uct_tcp_ep_progress_rx_remove_filter, ep);
+
     if (ep->flags & (UCT_TCP_EP_FLAG_CTX_TYPE_TX |
                      UCT_TCP_EP_FLAG_ON_PTR_MAP)) {
         /* The EP is exposed to the user: either it has TX capability or it
