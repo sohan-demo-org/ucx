@@ -239,30 +239,36 @@ protected:
     }
 
     void fill_ep_params(uct_ep_params_t &params, uct_tcp_device_addr_t *dev_addr,
-                        uct_tcp_iface_addr_t *iface_addr, uint16_t port)
+                        uct_tcp_iface_addr_t *iface_addr, uint16_t port,
+                        entity *ent)
     {
-        ASSERT_UCS_OK(uct_iface_get_device_address(m_ent->iface(),
+        ASSERT_UCS_OK(uct_iface_get_device_address(ent->iface(),
                                                    (uct_device_addr_t*)dev_addr));
         iface_addr->port = htons(port);
 
         params.field_mask = UCT_EP_PARAM_FIELD_IFACE |
                             UCT_EP_PARAM_FIELD_DEV_ADDR |
                             UCT_EP_PARAM_FIELD_IFACE_ADDR;
-        params.iface      = m_ent->iface();
+        params.iface      = ent->iface();
         params.dev_addr   = (uct_device_addr_t*)dev_addr;
         params.iface_addr = (uct_iface_addr_t*)iface_addr;
     }
 
-    /* CONNECT_TO_IFACE EP to a peer listening on @a port on the iface IP */
-    uct_ep_h create_ep_to_port(uint16_t port)
+    /* CONNECT_TO_IFACE EP on the iface of @a ent (default: the test's iface)
+     * to a peer listening on @a port on the iface IP */
+    uct_ep_h create_ep_to_port(uint16_t port, entity *ent = NULL)
     {
-        std::vector<uint8_t> dev_addr(m_ent->iface_attr().device_addr_len);
+        if (ent == NULL) {
+            ent = m_ent;
+        }
+
+        std::vector<uint8_t> dev_addr(ent->iface_attr().device_addr_len);
         uct_tcp_iface_addr_t iface_addr;
         uct_ep_params_t params;
         uct_ep_h ep;
 
         fill_ep_params(params, (uct_tcp_device_addr_t*)&dev_addr[0],
-                       &iface_addr, port);
+                       &iface_addr, port, ent);
         ASSERT_UCS_OK(uct_ep_create(&params, &ep));
         return ep;
     }
@@ -391,6 +397,44 @@ protected:
         while ((ep_count() != count) && (ucs_get_time() < deadline)) {
             progress();
         }
+    }
+
+    /* uct_iface_close() while a user EP is still establishing a connection
+     * and was not destroyed by the user: the EP is kept on the connection
+     * matching context and is destroyed by the iface cleanup, which must
+     * also take it off the timeout list - whether the deadline has expired
+     * (but the EP was not swept yet) or not. The EP is destroyed, not
+     * failed, so no error callback. A second iface is used so that all fds
+     * of the iface (and of the EP) can be checked for leaks */
+    void close_iface_with_armed_ep(bool expired)
+    {
+        struct sockaddr_storage listen_addr;
+        uct_tcp_iface_t *tcp_iface;
+        size_t fd_count;
+        entity *ent;
+
+        raw_listener(&listen_addr);
+        fd_count      = open_fd_count();
+        ent           = uct_test::create_entity(0, err_handler);
+        tcp_iface     = ucs_derived_of(ent->iface(), uct_tcp_iface_t);
+        uint16_t port = port_of((struct sockaddr*)&listen_addr);
+        uct_ep_h ep   = create_ep_to_port(port, ent);
+
+        EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
+        EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_ON_MATCH_CTX);
+        EXPECT_FALSE(ucs_list_is_empty(&tcp_iface->conn_timeout_list));
+        EXPECT_EQ(1u, tcp_iface->outstanding);
+
+        if (expired) {
+            spin_for(2 * CONN_TIMEOUT_SEC);
+            EXPECT_LT(tcp_ep(ep)->conn_deadline, ucs_get_time());
+        }
+
+        /* closes the iface, which destroys the leaked EP */
+        delete ent;
+
+        EXPECT_EQ(0u, m_err_count);
+        EXPECT_EQ(fd_count, open_fd_count());
     }
 
     /* Checks the invariants which must hold once the EP has been failed:
@@ -725,6 +769,23 @@ UCS_TEST_P(test_uct_tcp_conn_timeout, replace_ep_preread_then_timeout,
 
     uct_ep_destroy(ep);
     EXPECT_EQ(fd_count - 1, open_fd_count());
+}
+
+/* uct_iface_close() with a user EP which is still armed (CONNECTING /
+ * WAITING_ACK): the iface cleanup must not assume the timeout list is empty
+ * before the connection matching context, which holds the EP, is purged */
+UCS_TEST_P(test_uct_tcp_conn_timeout, iface_close_armed_ep,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    close_iface_with_armed_ep(false);
+}
+
+/* Same with an EP whose deadline expired but which was not swept yet (no
+ * progress between the deadline and uct_iface_close()) */
+UCS_TEST_P(test_uct_tcp_conn_timeout, iface_close_expired_ep,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    close_iface_with_armed_ep(true);
 }
 
 _UCT_INSTANTIATE_TEST_CASE(test_uct_tcp_conn_timeout, tcp)
