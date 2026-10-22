@@ -80,6 +80,15 @@ static ucs_config_field_t uct_tcp_iface_config_table[] = {
 
   UCT_TCP_USER_TIMEOUT(ucs_offsetof(uct_tcp_iface_config_t, user_timeout)),
 
+  {"CONN_TIMEOUT", "60s",
+   "Maximal time for an endpoint to complete the connection handshake (from\n"
+   "the start of connection establishment until the connection is fully\n"
+   "established). An endpoint which did not complete the handshake in time is\n"
+   "failed with an endpoint timeout error. The timer restarts on every\n"
+   "connection retry. \"inf\" disables the timeout.",
+   ucs_offsetof(uct_tcp_iface_config_t, conn_timeout),
+   UCS_CONFIG_TYPE_TIME_UNITS},
+
   UCT_IFACE_MPOOL_CONFIG_FIELDS("TX_", -1, 8, 128m, 1.0, "send",
                                 ucs_offsetof(uct_tcp_iface_config_t, tx_mpool), ""),
 
@@ -460,6 +469,10 @@ unsigned uct_tcp_iface_progress(uct_iface_h tl_iface)
     } while ((max_events > 0) && (read_events == UCT_TCP_MAX_EVENTS) &&
              ((status == UCS_OK) || (status == UCS_INPROGRESS)));
 
+    if (ucs_unlikely(!ucs_list_is_empty(&iface->handshake_ep_list))) {
+        count += uct_tcp_cm_conn_timeout_progress(iface);
+    }
+
     return count;
 }
 
@@ -760,6 +773,13 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_INVALID_PARAM;
     }
 
+    if ((config->conn_timeout == UCS_TIME_AUTO) ||
+        (config->conn_timeout == 0)) {
+        ucs_error("unsupported value was specified for the connection "
+                  "handshake timeout, expected a positive time or \"inf\"");
+        return UCS_ERR_INVALID_PARAM;
+    }
+
     if (config->max_conn_retries > UINT8_MAX) {
         ucs_error("unsupported value was specified (%u) for the maximal "
                   "connection retries, expected lower than %u",
@@ -776,6 +796,7 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_iface_t, uct_md_h md, uct_worker_h worker,
     self->config.max_conn_retries  = config->max_conn_retries;
     self->config.syn_cnt           = config->syn_cnt;
     self->config.user_timeout      = config->user_timeout;
+    self->config.conn_timeout      = config->conn_timeout;
     self->sockopt.nodelay          = config->sockopt_nodelay;
     self->sockopt.sndbuf           = config->sockopt.sndbuf;
     self->sockopt.rcvbuf           = config->sockopt.rcvbuf;
@@ -853,6 +874,7 @@ static UCS_CLASS_INIT_FUNC(uct_tcp_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     ucs_list_head_init(&self->ep_list);
+    ucs_list_head_init(&self->handshake_ep_list);
     ucs_conn_match_init(&self->conn_match_ctx, self->config.sockaddr_len,
                         UCT_TCP_CM_CONN_SN_MAX, &uct_tcp_cm_conn_match_ops);
     status = UCS_PTR_MAP_INIT(tcp_ep, &self->ep_ptr_map);
@@ -940,6 +962,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_tcp_iface_t)
 
     uct_tcp_iface_ep_list_cleanup(self);
     ucs_conn_match_cleanup(&self->conn_match_ctx);
+    ucs_assert(ucs_list_is_empty(&self->handshake_ep_list));
     UCS_PTR_MAP_DESTROY(tcp_ep, &self->ep_ptr_map);
 
     ucs_mpool_cleanup(&self->rx_mpool, 1);

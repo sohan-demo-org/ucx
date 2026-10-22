@@ -13,6 +13,64 @@
 #include <ucs/async/async.h>
 
 
+static int uct_tcp_cm_conn_state_is_handshake(uct_tcp_ep_conn_state_t state)
+{
+    return (state != UCT_TCP_EP_CONN_STATE_CLOSED) &&
+           (state != UCT_TCP_EP_CONN_STATE_CONNECTED);
+}
+
+static void uct_tcp_cm_handshake_timer_arm(uct_tcp_iface_t *iface,
+                                           uct_tcp_ep_t *ep)
+{
+    if (iface->config.conn_timeout == UCS_TIME_INFINITY) {
+        return;
+    }
+
+    /* EPs may enter a handshake state from the async thread during accepting
+     * a connection */
+    UCS_ASYNC_BLOCK(iface->super.worker->async);
+    ep->handshake_start_time = ucs_get_time();
+    ucs_list_add_tail(&iface->handshake_ep_list, &ep->handshake_list);
+    UCS_ASYNC_UNBLOCK(iface->super.worker->async);
+}
+
+static void uct_tcp_cm_handshake_timer_disarm(uct_tcp_iface_t *iface,
+                                              uct_tcp_ep_t *ep)
+{
+    UCS_ASYNC_BLOCK(iface->super.worker->async);
+    /* The element points to itself if it is not on the list */
+    ucs_list_del(&ep->handshake_list);
+    ucs_list_head_init(&ep->handshake_list);
+    UCS_ASYNC_UNBLOCK(iface->super.worker->async);
+}
+
+unsigned uct_tcp_cm_conn_timeout_progress(uct_tcp_iface_t *iface)
+{
+    ucs_time_t now = ucs_get_time();
+    unsigned count = 0;
+    uct_tcp_ep_t *ep;
+
+    UCS_ASYNC_BLOCK(iface->super.worker->async);
+    /* The list is ordered by the handshake start time. Take the list head on
+     * every iteration, since failing an EP may destroy other EPs */
+    while (!ucs_list_is_empty(&iface->handshake_ep_list)) {
+        ep = ucs_list_head(&iface->handshake_ep_list, uct_tcp_ep_t,
+                           handshake_list);
+        if (now < (ep->handshake_start_time + iface->config.conn_timeout)) {
+            break;
+        }
+
+        uct_tcp_cm_handshake_timer_disarm(iface, ep);
+        if (!(ep->flags & UCT_TCP_EP_FLAG_FAILED)) {
+            uct_tcp_ep_handle_conn_timeout(ep);
+            ++count;
+        }
+    }
+    UCS_ASYNC_UNBLOCK(iface->super.worker->async);
+
+    return count;
+}
+
 void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
                                   uct_tcp_ep_conn_state_t new_conn_state)
 {
@@ -26,6 +84,14 @@ void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
 
     old_conn_state = (uct_tcp_ep_conn_state_t)ep->conn_state;
     ep->conn_state = new_conn_state;
+
+    if (uct_tcp_cm_conn_state_is_handshake(new_conn_state)) {
+        if (old_conn_state == UCT_TCP_EP_CONN_STATE_CLOSED) {
+            uct_tcp_cm_handshake_timer_arm(iface, ep);
+        }
+    } else if (uct_tcp_cm_conn_state_is_handshake(old_conn_state)) {
+        uct_tcp_cm_handshake_timer_disarm(iface, ep);
+    }
 
     switch(ep->conn_state) {
     case UCT_TCP_EP_CONN_STATE_CONNECTING:
