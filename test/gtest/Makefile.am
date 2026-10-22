@@ -148,6 +148,7 @@ gtest_SOURCES = \
 	ucp/test_ucp_ep.cc \
 	ucp/test_ucp_stream.cc \
 	ucp/test_ucp_peer_failure.cc \
+	ucp/test_ucp_explore_ucp_wireup_tcp_lane_timeout.cc \
 	ucp/test_ucp_fault_tolerance.cc \
 	ucp/test_ucp_atomic.cc \
 	ucp/test_ucp_gpu_nic_assignment.cc \
