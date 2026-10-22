@@ -267,6 +267,56 @@ protected:
         return ep;
     }
 
+    /* Listening raw socket whose address is lower than the iface address, so
+     * that a CONNECT_TO_EP EP connected to it is the accepting side */
+    bool raw_listener_lower(struct sockaddr_storage *listen_addr)
+    {
+        ucs_status_t status;
+        int cmp;
+
+        for (int i = 0; i < 64; ++i) {
+            raw_listener(listen_addr);
+            cmp = ucs_sockaddr_cmp((struct sockaddr*)listen_addr, iface_addr(),
+                                   &status);
+            ASSERT_UCS_OK(status);
+            if (cmp < 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /* CONNECT_TO_EP EP connected to a peer EP on @a listen_addr: the local
+     * side is the accepting one, so the EP waits in ACCEPTING for CONN_REQ.
+     * @a dev_addr and @a ep_addr are filled with the (fake) peer addresses
+     * passed to uct_ep_connect_to_ep_v2() */
+    uct_ep_h connect_to_ep_accepting(const struct sockaddr *listen_addr,
+                                     std::vector<uint8_t> &dev_addr,
+                                     std::vector<uint8_t> &ep_addr)
+    {
+        uct_tcp_ep_addr_t *remote_addr = (uct_tcp_ep_addr_t*)&ep_addr[0];
+        uct_ep_connect_to_ep_params_t conn_params = {0};
+        uct_ep_params_t params;
+        uct_ep_h ep;
+
+        params.field_mask = UCT_EP_PARAM_FIELD_IFACE;
+        params.iface      = m_ent->iface();
+        ASSERT_UCS_OK(uct_ep_create(&params, &ep));
+        ASSERT_UCS_OK(uct_ep_get_address(ep, (uct_ep_addr_t*)&ep_addr[0]));
+        ASSERT_UCS_OK(uct_iface_get_device_address(
+                m_ent->iface(), (uct_device_addr_t*)&dev_addr[0]));
+        remote_addr->iface_addr.port = htons(port_of(listen_addr));
+        remote_addr->ptr_map_key     = 0x1234;
+
+        ASSERT_UCS_OK(uct_ep_connect_to_ep_v2(ep,
+                                              (uct_device_addr_t*)&dev_addr[0],
+                                              (uct_ep_addr_t*)&ep_addr[0],
+                                              &conn_params));
+        EXPECT_EQ(UCT_TCP_EP_CONN_STATE_ACCEPTING, conn_state(ep));
+        return ep;
+    }
+
     static uct_tcp_ep_t *tcp_ep(uct_ep_h ep)
     {
         return ucs_derived_of(ep, uct_tcp_ep_t);
@@ -530,49 +580,63 @@ UCS_TEST_P(test_uct_tcp_conn_timeout, connect_to_ep_accepting_stall,
 {
     std::vector<uint8_t> dev_addr(m_ent->iface_attr().device_addr_len);
     std::vector<uint8_t> ep_addr(m_ent->iface_attr().ep_addr_len);
-    uct_tcp_ep_addr_t *remote_addr = (uct_tcp_ep_addr_t*)&ep_addr[0];
-    uct_ep_connect_to_ep_params_t conn_params = {0};
     struct sockaddr_storage listen_addr;
-    uct_ep_params_t params;
     size_t fd_count;
     uct_ep_h ep;
-    int cmp;
-    ucs_status_t status;
 
-    /* find a peer port which makes the local side the accepting one */
-    for (int i = 0; i < 64; ++i) {
-        raw_listener(&listen_addr);
-        cmp = ucs_sockaddr_cmp((struct sockaddr*)&listen_addr, iface_addr(),
-                               &status);
-        ASSERT_UCS_OK(status);
-        if (cmp < 0) {
-            break;
-        }
-    }
-    if (cmp >= 0) {
+    if (!raw_listener_lower(&listen_addr)) {
         UCS_TEST_SKIP_R("could not get a peer port lower than the iface port");
     }
 
-    fd_count          = open_fd_count();
-    params.field_mask = UCT_EP_PARAM_FIELD_IFACE;
-    params.iface      = m_ent->iface();
-    ASSERT_UCS_OK(uct_ep_create(&params, &ep));
-    ASSERT_UCS_OK(uct_ep_get_address(ep, (uct_ep_addr_t*)&ep_addr[0]));
-    ASSERT_UCS_OK(uct_iface_get_device_address(m_ent->iface(),
-                                               (uct_device_addr_t*)&dev_addr[0]));
-    remote_addr->iface_addr.port =
-            htons(port_of((struct sockaddr*)&listen_addr));
-    remote_addr->ptr_map_key     = 0x1234;
-
-    ASSERT_UCS_OK(uct_ep_connect_to_ep_v2(ep, (uct_device_addr_t*)&dev_addr[0],
-                                          (uct_ep_addr_t*)&ep_addr[0],
-                                          &conn_params));
-    ASSERT_EQ(UCT_TCP_EP_CONN_STATE_ACCEPTING, conn_state(ep));
+    fd_count = open_fd_count();
+    ep       = connect_to_ep_accepting((struct sockaddr*)&listen_addr,
+                                       dev_addr, ep_addr);
     EXPECT_TRUE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_CONN_TIMEOUT_ARMED);
     EXPECT_EQ(1u, m_tcp_iface->outstanding);
 
     wait_for_err();
     check_failed_ep(ep);
+
+    uct_ep_destroy(ep);
+    EXPECT_EQ(fd_count, open_fd_count());
+}
+
+/* uct_ep_connect_to_ep_v2() on a CONNECT_TO_EP EP which timed out while
+ * waiting for CONN_REQ: the EP is CLOSED and not on the EP PTR map anymore
+ * (like after a peer disconnect), so the call must report
+ * UCS_ERR_CONNECTION_RESET without any further state change */
+UCS_TEST_P(test_uct_tcp_conn_timeout, connect_to_ep_after_accepting_timeout,
+           UCT_TCP_CONN_TIMEOUT_CFG)
+{
+    std::vector<uint8_t> dev_addr(m_ent->iface_attr().device_addr_len);
+    std::vector<uint8_t> ep_addr(m_ent->iface_attr().ep_addr_len);
+    uct_ep_connect_to_ep_params_t conn_params = {0};
+    struct sockaddr_storage listen_addr;
+    size_t fd_count;
+    uct_ep_h ep;
+
+    if (!raw_listener_lower(&listen_addr)) {
+        UCS_TEST_SKIP_R("could not get a peer port lower than the iface port");
+    }
+
+    fd_count = open_fd_count();
+    ep       = connect_to_ep_accepting((struct sockaddr*)&listen_addr,
+                                       dev_addr, ep_addr);
+
+    wait_for_err();
+    check_failed_ep(ep);
+
+    EXPECT_EQ(UCS_ERR_CONNECTION_RESET,
+              uct_ep_connect_to_ep_v2(ep, (uct_device_addr_t*)&dev_addr[0],
+                                      (uct_ep_addr_t*)&ep_addr[0],
+                                      &conn_params));
+    EXPECT_EQ(UCT_TCP_EP_CONN_STATE_CLOSED, conn_state(ep));
+    EXPECT_FALSE(tcp_ep(ep)->flags & UCT_TCP_EP_FLAG_ON_PTR_MAP);
+    EXPECT_EQ(0u, m_tcp_iface->outstanding);
+    EXPECT_TRUE(ucs_list_is_empty(&m_tcp_iface->conn_timeout_list));
+
+    progress_for(2 * CONN_TIMEOUT_SEC);
+    EXPECT_EQ(1u, m_err_count);
 
     uct_ep_destroy(ep);
     EXPECT_EQ(fd_count, open_fd_count());
